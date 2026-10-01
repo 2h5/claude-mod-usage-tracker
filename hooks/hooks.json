@@ -1,0 +1,4 @@
+{
+  "description": "The usage-dash hooks module",
+  "modules": ["./register.js"]
+}
