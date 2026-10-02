@@ -324,14 +324,12 @@ export function register(on) {
       band = bandParts(els, e.surface, layout)
       if (band.width <= room) break
     }
-    // Centred when it all fits, otherwise left-aligned so the end is what gets cut
-    const fits = band.width <= room
 
     // Keep whatever other mods draw in the band
     const rest = await next(e)
     const row = Box({
       flexDirection: 'row',
-      justifyContent: fits ? 'center' : 'space-between',
+      justifyContent: 'space-between',
       columnGap: 3,
       children: [Box({ flexDirection: 'row', columnGap: 1, alignItems: 'center', children: band.parts }), ...(right ? [right] : [])],
     })
