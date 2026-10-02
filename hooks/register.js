@@ -167,6 +167,72 @@ function setCompacting($, on) {
   $.ui.invalidate('ui.render')
 }
 
+// Band layouts, fullest first. Each step gives up one thing to keep the reset times in view:
+// the "resets in" words, then the cache figure, then minutes, then the limit bars, then the ctx bar.
+const BAND_LAYOUTS = [
+  { resetWords: true, cache: true, exactTime: true, limitBars: true, ctxBar: true },
+  { resetWords: false, cache: true, exactTime: true, limitBars: true, ctxBar: true },
+  { resetWords: false, cache: false, exactTime: true, limitBars: true, ctxBar: true },
+  { resetWords: false, cache: false, exactTime: false, limitBars: true, ctxBar: true },
+  { resetWords: false, cache: false, exactTime: false, limitBars: false, ctxBar: true },
+  { resetWords: false, cache: false, exactTime: false, limitBars: false, ctxBar: false },
+]
+
+// Time left in its largest unit only: 3h 34m -> 3h
+function roughTimeLeft(iso) {
+  return timeLeft(iso).split(' ')[0]
+}
+
+// The band's pieces for one layout, and roughly how many cells wide they come to
+function bandParts(els, surface, layout) {
+  const { Text } = els
+  const parts = []
+  let width = 0
+  const add = (node, cells) => {
+    width += (parts.length ? 1 : 0) + cells
+    parts.push(node)
+  }
+  const text = (s, props = {}) => add(Text({ ...props, children: [s] }), s.length)
+  // A desktop bar is drawn in pixels; count about 7 per cell so the estimate errs wide
+  const meter = (pct, px, cols) => add(meterBar(els, surface, pct, px, cols), surface === 'desktop' ? Math.ceil(px / 7) : cols)
+
+  const ctx = usage.context
+  if (ctx.percent != null) {
+    text('ctx', { dimColor: true })
+    if (layout.ctxBar) meter(ctx.percent, 90, 10)
+    text(tokens(ctx.tokens))
+  } else {
+    text('ctx —', { dimColor: true })
+  }
+  const hit = cacheHitPct()
+  if (layout.cache && hit != null) {
+    text('·', { dimColor: true })
+    text('cache', { dimColor: true })
+    text(hit + '%')
+  }
+  // Each limit as its own group: label, small bar, percent, and when it resets
+  for (const limit of usage.rateLimits) {
+    text('│', { dimColor: true })
+    text(limitName(limit.kind, true), { dimColor: true })
+    if (layout.limitBars) meter(limit.percentUsed, 40, 5)
+    text(limit.percentUsed + '%')
+    const left = layout.exactTime ? timeLeft(limit.resetsAt) : roughTimeLeft(limit.resetsAt)
+    if (!left) {
+      if (limit.resetsAt) text('resetting', { dimColor: true })
+      continue
+    }
+    text(layout.resetWords ? 'resets in' : '↻', { dimColor: true })
+    // Only the weekly time is coloured, by whether the week's usage is on pace
+    if (limit.kind === 'seven_day') text(left, { color: weeklyPaceColor(limit.percentUsed, limit.resetsAt) })
+    else text(left, { dimColor: true })
+  }
+  if (usage.cost != null) {
+    text('│', { dimColor: true })
+    text(usd(usage.cost.usd))
+  }
+  return { parts, width }
+}
+
 async function poll($) {
   usage = await $.session.usage()
   await saveCost($)
@@ -247,61 +313,27 @@ export function register(on) {
     if (!showBand) return next(e)
     const els = $.ui.resolve(e)
     const { Box, Text } = els
-    const ctx = usage.context
-    const parts = []
-
-    if (ctx.percent != null) {
-      parts.push(
-        Text({ dimColor: true, children: ['ctx'] }),
-        meterBar(els, e.surface, ctx.percent, 90, 10),
-        Text({ children: [tokens(ctx.tokens)] }),
-      )
-    } else {
-      parts.push(Text({ dimColor: true, children: ['ctx —'] }))
-    }
-    const hit = cacheHitPct()
-    if (hit != null) {
-      parts.push(
-        Text({ dimColor: true, children: ['·'] }),
-        Text({ dimColor: true, children: ['cache'] }),
-        Text({ children: [hit + '%'] }),
-      )
-    }
-    // Each limit as its own group: label, small bar, percent, and when it resets
-    for (const limit of usage.rateLimits) {
-      parts.push(
-        Text({ dimColor: true, children: ['│'] }),
-        Text({ dimColor: true, children: [limitName(limit.kind, true)] }),
-        meterBar(els, e.surface, limit.percentUsed, 40, 5),
-        Text({ children: [limit.percentUsed + '%'] }),
-      )
-      const left = timeLeft(limit.resetsAt)
-      if (limit.kind === 'seven_day' && left) {
-        // Only the time is coloured, by whether the week's usage is on pace
-        parts.push(
-          Text({ dimColor: true, children: ['resets in'] }),
-          Text({ color: weeklyPaceColor(limit.percentUsed, limit.resetsAt), wrap: 'truncate', children: [left] }),
-        )
-      } else {
-        parts.push(Text({ dimColor: true, wrap: 'truncate', children: [countdown(limit.resetsAt)] }))
-      }
-    }
-    if (usage.cost != null) {
-      parts.push(Text({ dimColor: true, children: ['│'] }), Text({ children: [usd(usage.cost.usd)] }))
-    }
-    if (history.length > 1) {
-      parts.push(Text({ dimColor: true, children: ['· ' + sparkline(history.slice(-12))] }))
-    }
-
     // Spinner on the right edge while a compaction runs
-    const right = compacting ? Text({ color: '#2a78d6', children: [SPIN[spinFrame] + ' compacting…'] }) : null
+    const spin = SPIN[spinFrame] + ' compacting…'
+    const right = compacting ? Text({ color: '#2a78d6', children: [spin] }) : null
+
+    // Pick the fullest layout that fits the window, so the reset times are never cut off
+    const room = (e.viewport?.columns ?? Infinity) - 2 - (compacting ? spin.length + 3 : 0)
+    let band
+    for (const layout of BAND_LAYOUTS) {
+      band = bandParts(els, e.surface, layout)
+      if (band.width <= room) break
+    }
+    // Centred when it all fits, otherwise left-aligned so the end is what gets cut
+    const fits = band.width <= room
 
     // Keep whatever other mods draw in the band
     const rest = await next(e)
     const row = Box({
       flexDirection: 'row',
-      justifyContent: 'space-between',
-      children: [Box({ flexDirection: 'row', columnGap: 1, alignItems: 'center', children: parts }), ...(right ? [right] : [])],
+      justifyContent: fits ? 'center' : 'space-between',
+      columnGap: 3,
+      children: [Box({ flexDirection: 'row', columnGap: 1, alignItems: 'center', children: band.parts }), ...(right ? [right] : [])],
     })
     return rest ? Box({ flexDirection: 'column', children: [row, rest] }) : row
   })
