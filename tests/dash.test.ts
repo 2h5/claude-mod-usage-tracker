@@ -41,3 +41,59 @@ test('cache hit counts every model request', async ($, on) => {
   // The mod's hook passes the response through unchanged
   expect(r.usage.cache_read_input_tokens).toBe(90)
 })
+
+test('toggling autocompact re-reads the compaction threshold, estimated locally', async ($, on) => {
+  stubs(on)
+  const asked = []
+  on('session.usage', (_$, e) => {
+    asked.push(e.breakdown)
+    return { value: { context: { window: 200_000, tokens: 80_000, percent: 40 }, rateLimits: [] } }
+  })
+  on('config.set', (_$, e) => ({ value: e.value }))
+  await $.config.set({ key: 'autoCompact', value: false })
+  expect(asked).toEqual(['summary'])
+})
+
+test('the band\'s Compact button compacts the session', async ($, on) => {
+  stubs(on)
+  on('session.usage', () => ({ value: { context: { window: 200_000, tokens: 80_000, percent: 40 }, rateLimits: [] } }))
+  const triggers = []
+  on('session.compact', (_$, e) => (triggers.push(e.trigger), { skip: 'test' }))
+  // Nothing else draws in the band, as with no other mods
+  on('ui.render', ($, e) => ($.ui.resolve(e).Box({ children: [] })))
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await $.ui.mount({ plugin: 'usage-dash', surface, component: 'AbovePrompt', props: {} })
+    await ui.press({ key: 'compact' })
+    await ui.unmount()
+  }
+  expect(triggers.length).toBe(2)
+})
+
+test('Compact hides while a turn runs and comes back after', async ($, on) => {
+  stubs(on)
+  on('session.usage', () => ({ value: { context: { window: 200_000, tokens: 80_000, percent: 40 }, rateLimits: [] } }))
+  on('ui.render', ($, e) => $.ui.resolve(e).Box({ children: [] }))
+  on('turn.start', (_$, e) => ({ turnId: 't' }))
+  on('turn.complete', () => ({ text: '' }))
+  const ui = await $.ui.mount({ plugin: 'usage-dash', surface: 'terminal', component: 'AbovePrompt', props: {} })
+  expect(await ui.find({ key: 'compact' })).toBeDefined()
+  await $.turn.start({ prompt: 'hi' })
+  expect(await ui.find({ key: 'compact' })).toBeUndefined()
+  await $.turn.complete({ turnId: 't' })
+  expect(await ui.find({ key: 'compact' })).toBeDefined()
+  await ui.unmount()
+})
+
+test('where compact has no direct call, the button runs the /compact command', async ($, on) => {
+  stubs(on)
+  on('session.usage', () => ({ value: { context: { window: 200_000, tokens: 80_000, percent: 40 }, rateLimits: [] } }))
+  on('ui.render', ($, e) => $.ui.resolve(e).Box({ children: [] }))
+  on('session.compact', () => { throw new Error('not available in a headless session') })
+  const sent = []
+  on('ui.toast', (_$, e) => (sent.push('toast: ' + e.text), {}))
+  on('command.run', { command: 'compact' }, (_$, e) => (sent.push('/' + e.command), { text: '' }))
+  const ui = await $.ui.mount({ plugin: 'usage-dash', surface: 'desktop', component: 'AbovePrompt', props: {} })
+  await ui.press({ key: 'compact' })
+  await ui.unmount()
+  expect(sent).toEqual(['/compact'])
+})

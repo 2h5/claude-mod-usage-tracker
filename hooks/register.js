@@ -17,8 +17,29 @@ let sessionId = ''
 let todayUsd = 0
 let todaySessions = 0
 let compacting = false
+// Token count where auto-compaction runs, or null when it's off (then the model's window is the limit)
+let compactAt = null
 
 const SPARK = '▁▂▃▄▅▆▇█'
+// Stands in for "resets in", in the band and the pane
+const RESET = '↻'
+
+// Context fill against the point where it compacts, or against the model's window when autocompact is off
+function ctxPercent(ctx) {
+  if (compactAt && ctx.tokens != null) return Math.min(100, Math.round((ctx.tokens / compactAt) * 100))
+  return ctx.percent
+}
+
+// Read the autocompact threshold. A 'summary' breakdown is estimated locally and sends no requests.
+async function refreshCompactAt($) {
+  try {
+    const b = (await $.session.usage({ breakdown: 'summary' })).context.breakdown
+    if (b) compactAt = b.isAutoCompactEnabled ? (b.autoCompactThreshold ?? null) : null
+  } catch (err) {
+    $.ui.log('could not read the autocompact threshold: ' + err.message)
+  }
+  $.ui.invalidate('ui.render')
+}
 
 function bar(pct, width) {
   const filled = Math.max(0, Math.min(width, Math.round((pct / 100) * width)))
@@ -67,7 +88,7 @@ function usd(n) {
   return '$' + (n ?? 0).toFixed(2)
 }
 
-// Time left until a reset, without the "resets in" words
+// Time left until a reset, without the ↻
 function timeLeft(iso) {
   if (!iso) return ''
   const ms = new Date(iso).getTime() - Date.now()
@@ -84,7 +105,7 @@ function timeLeft(iso) {
 function countdown(iso) {
   if (!iso) return ''
   const left = timeLeft(iso)
-  return left ? 'resets in ' + left : 'resetting'
+  return left ? RESET + ' ' + left : 'resetting'
 }
 
 // Weekly pacing: an even spread is 100% over 7 days (~14.3% a day).
@@ -141,9 +162,14 @@ async function refreshToday($) {
   todaySessions = count
 }
 
-// Prompt-cache totals over every model request since the mod loaded, subagents included
+// Prompt-cache totals over every model request this session, subagents included.
+// Mirrored in $.state so a mod reload doesn't zero them.
+const CACHE = { plugin: 'usage-dash', key: 'cache' }
 let cacheRead = 0
 let promptTokens = 0
+// True while the main loop runs a turn: the Compact button hides then
+let running = false
+const ORANGE = '#d97757'
 
 // Share of prompt tokens served from the cache, or null before the first request
 function cacheHitPct() {
@@ -168,14 +194,13 @@ function setCompacting($, on) {
 }
 
 // Band layouts, fullest first. Each step gives up one thing to keep the reset times in view:
-// the "resets in" words, then the cache figure, then minutes, then the limit bars, then the ctx bar.
+// the cache figure, then minutes, then the limit bars, then the ctx bar.
 const BAND_LAYOUTS = [
-  { resetWords: true, cache: true, exactTime: true, limitBars: true, ctxBar: true },
-  { resetWords: false, cache: true, exactTime: true, limitBars: true, ctxBar: true },
-  { resetWords: false, cache: false, exactTime: true, limitBars: true, ctxBar: true },
-  { resetWords: false, cache: false, exactTime: false, limitBars: true, ctxBar: true },
-  { resetWords: false, cache: false, exactTime: false, limitBars: false, ctxBar: true },
-  { resetWords: false, cache: false, exactTime: false, limitBars: false, ctxBar: false },
+  { cache: true, exactTime: true, limitBars: true, ctxBar: true },
+  { cache: false, exactTime: true, limitBars: true, ctxBar: true },
+  { cache: false, exactTime: false, limitBars: true, ctxBar: true },
+  { cache: false, exactTime: false, limitBars: false, ctxBar: true },
+  { cache: false, exactTime: false, limitBars: false, ctxBar: false },
 ]
 
 // Time left in its largest unit only: 3h 34m -> 3h
@@ -197,9 +222,10 @@ function bandParts(els, surface, layout) {
   const meter = (pct, px, cols) => add(meterBar(els, surface, pct, px, cols), surface === 'desktop' ? Math.ceil(px / 7) : cols)
 
   const ctx = usage.context
-  if (ctx.percent != null) {
+  const pct = ctxPercent(ctx)
+  if (pct != null) {
     text('ctx', { dimColor: true })
-    if (layout.ctxBar) meter(ctx.percent, 90, 10)
+    if (layout.ctxBar) meter(pct, 60, 7)
     text(tokens(ctx.tokens))
   } else {
     text('ctx —', { dimColor: true })
@@ -221,7 +247,7 @@ function bandParts(els, surface, layout) {
       if (limit.resetsAt) text('resetting', { dimColor: true })
       continue
     }
-    text(layout.resetWords ? 'resets in' : '↻', { dimColor: true })
+    text(RESET, { dimColor: true })
     // Only the weekly time is coloured, by whether the week's usage is on pace
     if (limit.kind === 'seven_day') text(left, { color: weeklyPaceColor(limit.percentUsed, limit.resetsAt) })
     else text(left, { dimColor: true })
@@ -245,7 +271,10 @@ export function register(on) {
     sessionId = await $.session.id()
     const saved = await $.store.get('band')
     if (typeof saved === 'boolean') showBand = saved
+    const { value: cache } = await $.state.get(CACHE)
+    if (cache) ({ read: cacheRead, prompt: promptTokens } = cache)
     await poll($)
+    await refreshCompactAt($)
     // Keep reset countdowns and the machine-wide total current between turns
     $.clock.every(30_000, () => poll($))
     try {
@@ -264,8 +293,9 @@ export function register(on) {
   // Pushed after each turn and whenever a limit moves a whole point
   on('session.measure', async ($, e, next) => {
     usage = { context: e.context, rateLimits: e.rateLimits, cost: e.cost }
-    if (e.changed.includes('context') && e.context.percent != null) {
-      history = [...history, e.context.percent].slice(-HISTORY_MAX)
+    const pct = ctxPercent(e.context)
+    if (e.changed.includes('context') && pct != null) {
+      history = [...history, pct].slice(-HISTORY_MAX)
     }
     if (e.changed.includes('cost')) {
       await saveCost($)
@@ -283,7 +313,15 @@ export function register(on) {
       return await next(e)
     } finally {
       setCompacting($, false)
+      await refreshCompactAt($)
     }
+  })
+
+  // Autocompact switched on or off in /config: the bar's limit moves with it
+  on('config.set', { key: 'autoCompact' }, async ($, e, next) => {
+    const r = await next(e)
+    await refreshCompactAt($)
+    return r
   })
 
   on('command.run', { command: 'dash' }, async ($, e) => {
@@ -303,22 +341,74 @@ export function register(on) {
     if (r.usage) {
       cacheRead += r.usage.cache_read_input_tokens
       promptTokens += r.usage.input_tokens + r.usage.cache_read_input_tokens + r.usage.cache_creation_input_tokens
+      await $.state.set(CACHE, { read: cacheRead, prompt: promptTokens })
       $.ui.invalidate('ui.render')
     }
     return r
+  })
+
+  // The main loop's turn: hide Compact from its start to its end
+  on('turn.start', async ($, e, next) => {
+    if (e.agentId === undefined) {
+      running = true
+      $.ui.invalidate('ui.render')
+    }
+    return next(e)
+  })
+  on('turn.complete', async ($, e, next) => {
+    if (e.agentId === undefined) {
+      running = false
+      $.ui.invalidate('ui.render')
+    }
+    return next(e)
   })
 
   // The one-line band above the prompt
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     if (!showBand) return next(e)
     const els = $.ui.resolve(e)
-    const { Box, Text } = els
-    // Spinner on the right edge while a compaction runs
+    const { Box, Text, Button } = els
+    // Right edge: the spinner while a compaction runs, else the Compact button between turns
     const spin = SPIN[spinFrame] + ' compacting…'
-    const right = compacting ? Text({ color: '#2a78d6', children: [spin] }) : null
+    let right = null
+    let rightCells = 0
+    if (compacting) {
+      right = Text({ color: ORANGE, children: [spin] })
+      rightCells = spin.length
+    } else if (!running) {
+      // The same call /compact makes; the session.compact hook above shows the spinner.
+      // An SDK host (the desktop app) has no direct call: try the /compact command, then
+      // put /compact in the prompt box for one Enter. Each failure is named in the toast.
+      const onPress = async () => {
+        const failed = []
+        try {
+          await $.session.compact()
+          return
+        } catch (err) {
+          failed.push('direct: ' + err.message)
+        }
+        try {
+          await $.command.run({ command: 'compact', args: '' })
+          return
+        } catch (err) {
+          failed.push('command: ' + err.message)
+        }
+        try {
+          const { isFilled, refusal } = await $.prompt.fill({ text: '/compact' })
+          if (isFilled) return $.ui.toast('Press Enter to compact')
+          failed.push('prompt box: ' + (refusal ?? 'refused'))
+        } catch (err) {
+          failed.push('prompt box: ' + err.message)
+        }
+        $.ui.log('compact failed: ' + failed.join(' | '))
+        $.ui.toast('Could not compact here; type /compact. ' + failed.map((f) => f.split(':')[0]).join(', ') + ' all failed')
+      }
+      right = Button({ key: 'compact', plain: true, onPress, children: [Text({ color: ORANGE, children: ['Compact'] })] })
+      rightCells = 7
+    }
 
     // Pick the fullest layout that fits the window, so the reset times are never cut off
-    const room = (e.viewport?.columns ?? Infinity) - 2 - (compacting ? spin.length + 3 : 0)
+    const room = (e.viewport?.columns ?? Infinity) - 2 - (right ? rightCells + 3 : 0)
     let band
     for (const layout of BAND_LAYOUTS) {
       band = bandParts(els, e.surface, layout)
@@ -359,8 +449,10 @@ export function register(on) {
       })
 
     rows.push(heading('Context window'))
-    if (ctx.percent != null) {
-      rows.push(meter(ctx.percent, tokens(ctx.tokens)))
+    const pct = ctxPercent(ctx)
+    if (pct != null) {
+      const limit = compactAt ? 'compacts at ' + tokens(compactAt) : tokens(ctx.window) + ' window'
+      rows.push(meter(pct, tokens(ctx.tokens) + ' of ' + limit))
     } else {
       rows.push(Text({ dimColor: true, children: ['No reading yet: send a prompt first (' + tokens(ctx.window) + ' window)'] }))
     }
@@ -401,7 +493,7 @@ export function register(on) {
         flexDirection: 'row',
         columnGap: 3,
         children: [
-          Button({ key: 'refresh', label: 'Refresh', hotkey: 'r', plain: true, onPress: () => poll($) }),
+          Button({ key: 'refresh', label: 'Refresh', hotkey: 'r', plain: true, onPress: () => Promise.all([poll($), refreshCompactAt($)]) }),
           Button({
             key: 'band',
             label: 'Band ' + (showBand ? 'off' : 'on'),
