@@ -2,7 +2,7 @@
 
 A Claude Code mod that shows your usage in a bar above the prompt:
 
-- **ctx**: how full the context window is, with the token count
+- **ctx**: how full the context window is, with the token count. With autocompact on, 100% is where it compacts; with it off, 100% is the model's full window
 - **cache**: share of prompt tokens served from the cache
 - **5h / 7d**: plan limit bars with time until reset
 - **Weekly pace**: the 7d reset time turns green when you're on pace (about 14% a day or less), yellow when you're up to a day ahead, red when you're a day or more ahead
